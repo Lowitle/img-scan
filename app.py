@@ -38,7 +38,6 @@ def obtener_esquinas_gemini(img_bytes):
         '{"top_left": [x,y], "top_right": [x,y], "bottom_right": [x,y], "bottom_left": [x,y]}'
     )
 
-    # Utiliza el modelo gemini-3.6-flash disponible en tu clave API
     response = client.models.generate_content(
         model='gemini-3.6-flash',
         contents=[
@@ -52,5 +51,89 @@ def obtener_esquinas_gemini(img_bytes):
     )
 
     texto_json = response.text.strip()
-    if texto_json.startswith("```json"):
-        texto_json = texto_json.replace("
+    
+    # Extraer únicamente el bloque entre la primera '{' y la última '}'
+    start = texto_json.find('{')
+    end = texto_json.rfind('}') + 1
+    if start != -1 and end != 0:
+        texto_json = texto_json[start:end]
+
+    return json.loads(texto_json)
+
+def transformar_perspectiva(img, esquinas_norm):
+    """Realiza la deformación matemática en 3D para dejar la hoja totalmente plana."""
+    h, w = img.shape[:2]
+
+    pts = np.float32([
+        [esquinas_norm['top_left'][0] * w / 1000.0, esquinas_norm['top_left'][1] * h / 1000.0],
+        [esquinas_norm['top_right'][0] * w / 1000.0, esquinas_norm['top_right'][1] * h / 1000.0],
+        [esquinas_norm['bottom_right'][0] * w / 1000.0, esquinas_norm['bottom_right'][1] * h / 1000.0],
+        [esquinas_norm['bottom_left'][0] * w / 1000.0, esquinas_norm['bottom_left'][1] * h / 1000.0]
+    ])
+
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    ancho_A = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    ancho_B = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[0] - tl[0]) ** 2))
+    max_ancho = max(int(ancho_A), int(ancho_B))
+
+    alto_A = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    alto_B = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    max_alto = max(int(alto_A), int(alto_B))
+
+    dst = np.array([
+        [0, 0],
+        [max_ancho - 1, 0],
+        [max_ancho - 1, max_alto - 1],
+        [0, max_alto - 1]], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(img, M, (max_ancho, max_alto))
+
+def aplicar_filtro_limpieza(img):
+    """Blanquea sombras del fondo manteniendo tintas, logos a color y el trazo de bolígrafo."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    bg = cv2.GaussianBlur(l, (33, 33), 0)
+    l_norm = cv2.divide(l, bg, scale=255)
+    l_norm = cv2.normalize(l_norm, None, 0, 255, cv2.NORM_MINMAX)
+    lab_clean = cv2.merge((l_norm, a, b))
+    return cv2.cvtColor(lab_clean, cv2.COLOR_LAB2BGR)
+
+@app.route('/escanear', methods=['POST'])
+def escanear():
+    if 'imagen' not in request.files:
+        return "No image provided", 400
+
+    file = request.files['imagen']
+    img_bytes = file.read()
+
+    npimg = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return "Invalid image format", 400
+
+    try:
+        esquinas = obtener_esquinas_gemini(img_bytes)
+        print(f"Esquinas detectadas por IA: {esquinas}", flush=True)
+
+        recortado = transformar_perspectiva(img, esquinas)
+        resultado = aplicar_filtro_limpieza(recortado)
+    except Exception as e:
+        print("--- ERROR EN PROCESAMIENTO ---", flush=True)
+        print(traceback.format_exc(), flush=True)
+        resultado = img
+
+    resultado_rgb = cv2.cvtColor(resultado, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(resultado_rgb)
+
+    pdf_io = io.BytesIO()
+    pil_img.save(pdf_io, format='PDF', resolution=100.0)
+    pdf_io.seek(0)
+
+    return send_file(pdf_io, mimetype='application/pdf')
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
