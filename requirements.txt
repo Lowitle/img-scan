@@ -1,4 +1,5 @@
 Flask
 opencv-python-headless
 numpy
+Pillow
 setuptools
