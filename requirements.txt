@@ -1,7 +1,6 @@
 Flask
 opencv-python-headless
 numpy
-imutils
-scikit-image
 Pillow
+google-genai
 setuptools
