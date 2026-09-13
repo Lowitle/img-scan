@@ -23,13 +23,27 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-def obtener_esquinas_gemini(img_bytes):
-    """Consulta a la API de Gemini para identificar las 4 esquinas exactas del folio."""
+def preparar_imagen_ligera(img, max_dim=1024):
+    """Comprime la imagen en memoria para enviarla ultrarrápido a Gemini."""
+    h, w = img.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / float(max(h, w))
+        new_w, new_h = int(w * scale), int(h * scale)
+        img_res = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        img_res = img
+
+    _, buffer = cv2.imencode('.jpg', img_res, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    return buffer.tobytes()
+
+def obtener_esquinas_gemini(img):
+    """Envia la imagen comprimida a Gemini para obtener las coordenadas en 1-2 segundos."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("CRÍTICO: La variable GEMINI_API_KEY no está configurada en Render.")
 
     client = genai.Client(api_key=api_key)
+    img_bytes_ligeros = preparar_imagen_ligera(img)
     
     prompt = (
         "Identifica las 4 esquinas exteriores del documento/folio en la imagen. "
@@ -41,7 +55,7 @@ def obtener_esquinas_gemini(img_bytes):
     response = client.models.generate_content(
         model='gemini-3.6-flash',
         contents=[
-            types.Part.from_bytes(data=img_bytes, mime_type='image/jpeg'),
+            types.Part.from_bytes(data=img_bytes_ligeros, mime_type='image/jpeg'),
             prompt
         ],
         config=types.GenerateContentConfig(
@@ -52,7 +66,6 @@ def obtener_esquinas_gemini(img_bytes):
 
     texto_json = response.text.strip()
     
-    # Extraer únicamente el bloque entre la primera '{' y la última '}'
     start = texto_json.find('{')
     end = texto_json.rfind('}') + 1
     if start != -1 and end != 0:
@@ -61,7 +74,7 @@ def obtener_esquinas_gemini(img_bytes):
     return json.loads(texto_json)
 
 def transformar_perspectiva(img, esquinas_norm):
-    """Realiza la deformación matemática en 3D para dejar la hoja totalmente plana."""
+    """Aplica la transformación 3D sobre la imagen en ALTA RESOLUCIÓN original."""
     h, w = img.shape[:2]
 
     pts = np.float32([
@@ -92,7 +105,7 @@ def transformar_perspectiva(img, esquinas_norm):
     return cv2.warpPerspective(img, M, (max_ancho, max_alto))
 
 def aplicar_filtro_limpieza(img):
-    """Blanquea sombras del fondo manteniendo tintas, logos a color y el trazo de bolígrafo."""
+    """Blanquea sombras manteniendo el color y nitidez."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     bg = cv2.GaussianBlur(l, (33, 33), 0)
@@ -116,9 +129,11 @@ def escanear():
         return "Invalid image format", 400
 
     try:
-        esquinas = obtener_esquinas_gemini(img_bytes)
+        # 1. Obtención ultra rápida de esquinas con imagen comprimida
+        esquinas = obtener_esquinas_gemini(img)
         print(f"Esquinas detectadas por IA: {esquinas}", flush=True)
 
+        # 2. Recorte 3D sobre la foto original en alta resolución
         recortado = transformar_perspectiva(img, esquinas)
         resultado = aplicar_filtro_limpieza(recortado)
     except Exception as e:
