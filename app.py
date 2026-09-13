@@ -38,11 +38,30 @@ def transformar_perspectiva(imagen, pts):
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(imagen, M, (max_ancho, max_alto))
 
+def mejorar_calidad_escaner(img):
+    """
+    Elimina sombras y blanquea el fondo del papel sin pixelar el texto
+    preservando el color de los elementos gráficos y bolígrafos.
+    """
+    canales = cv2.split(img)
+    canales_procesados = []
+    
+    for canal in canales:
+        # Estimación profunda del fondo de iluminación
+        bg = cv2.GaussianBlur(canal, (51, 51), 0)
+        # División de fondo para aplanar sombras y eliminar amarilleo
+        division = cv2.divide(canal, bg, scale=255)
+        # Normalización para máximo contraste
+        norm = cv2.normalize(division, None, 0, 255, cv2.NORM_MINMAX)
+        canales_procesados.append(norm)
+        
+    return cv2.merge(canales_procesados)
+
 def procesar_escaneo(img):
     h_orig, w_orig = img.shape[:2]
     area_total = h_orig * w_orig
     
-    # 1. Reescalar a una altura estándar para detectar contornos limpios
+    # 1. Reescalar a resolución de trabajo ligera para detección de bordes
     target_h = 800.0
     ratio = h_orig / target_h
     new_w = int(w_orig / ratio)
@@ -51,14 +70,9 @@ def procesar_escaneo(img):
     gris = cv2.cvtColor(peque, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gris, (5, 5), 0)
     
-    # Umbral de Otsu + Canny para separar el papel blanco del fondo de madera
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    edged = cv2.Canny(blur, 50, 150)
-    combinado = cv2.bitwise_or(edged, thresh)
-    
-    # Cerrar grietas en el borde del folio
+    edged = cv2.Canny(blur, 30, 120)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(combinado, cv2.MORPH_CLOSE, kernel)
+    closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
     
     cnts, _ = cv2.findContours(closed.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
@@ -68,8 +82,7 @@ def procesar_escaneo(img):
         area_peque = cv2.contourArea(c)
         area_real = area_peque * (ratio ** 2)
         
-        # Descartar elementos internos (debe ocupar al menos el 20% de la foto)
-        if area_real < (area_total * 0.20):
+        if area_real < (area_total * 0.25):
             continue
             
         peri = cv2.arcLength(c, True)
@@ -78,20 +91,15 @@ def procesar_escaneo(img):
             doc_cnt = approx
             break
 
-    # Si encuentra los 4 bordes del papel principal
+    # 2. Enderezar en 3D
     if doc_cnt is not None:
         pts_orig = doc_cnt.reshape(4, 2) * ratio
         recortado = transformar_perspectiva(img, pts_orig)
     else:
         recortado = img
 
-    # Aplicar el filtro de contraste para escáner
-    recortado_gris = cv2.cvtColor(recortado, cv2.COLOR_BGR2GRAY)
-    escaner = cv2.adaptiveThreshold(
-        recortado_gris, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 21, 11
-    )
-    return escaner
+    # 3. Aplicar limpieza de iluminación y blanqueado
+    return mejorar_calidad_escaner(recortado)
 
 @app.route('/escanear', methods=['POST'])
 def escanear():
@@ -109,7 +117,10 @@ def escanear():
 
     resultado = procesar_escaneo(img)
 
-    pil_img = Image.fromarray(resultado)
+    # Conversión BGR a RGB para la exportación correcta a PDF
+    resultado_rgb = cv2.cvtColor(resultado, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(resultado_rgb)
+    
     pdf_io = io.BytesIO()
     pil_img.save(pdf_io, format='PDF', resolution=100.0)
     pdf_io.seek(0)
